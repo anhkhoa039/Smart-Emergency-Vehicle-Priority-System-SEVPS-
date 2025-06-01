@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <!-- Emergency Vehicle Types -->
+    <vType id="ambulance" vClass="emergency" speedFactor="1.2" speedDev="0.1" accel="2.6" decel="4.5" sigma="0.5" length="5.0" minGap="2.5" maxSpeed="50.0" probability="0.0" guiShape="emergency" laneChangeModel="LC2013">
+       <param key="has.bluelight.device" value="true"/>
+       <param key="device.bluelight.reactiondist" value="100"/>
+         <param key="lcStrategic" value="1.0"/>
+         <param key="lcCooperative" value="0.0"/>
+         <param key="lcSpeedGain" value="1.0"/>
+         <param key="lcPushy" value="1.0"/>
+         <param key="lcAssertive" value="1.0"/>
+         <param key="lcKeepRight" value="0.0"/>
+
+    </vType>
+
+    <vType id="fire_truck" vClass="emergency" speedFactor="1.1" speedDev="0.1" accel="2.6" decel="4.5" sigma="0.5" length="7.0" minGap="2.5" maxSpeed="45.0" probability="0.0" guiShape="firebrigade" laneChangeModel="LC2013">
+       <param key="has.bluelight.device" value="true"/>
+       <param key="device.bluelight.reactiondist" value="100"/>
+      <param key="lcStrategic" value="1.0"/>
+      <param key="lcCooperative" value="0.0"/>
+      <param key="lcSpeedGain" value="1.0"/>
+      <param key="lcPushy" value="1.0"/>
+      <param key="lcAssertive" value="1.0"/>
+      <param key="lcKeepRight" value="0.0"/>
+
+    </vType>
+    <vType id="police" vClass="emergency" speedFactor="1.3" speedDev="0.1" accel="2.6" decel="4.5" sigma="0.5" length="5.0" minGap="2.5" maxSpeed="55.0" probability="0.0" guiShape="police" laneChangeModel="LC2013">
+       <param key="has.bluelight.device" value="true"/>
+       <param key="device.bluelight.reactiondist" value="100"/>
+      <param key="lcStrategic" value="1.0"/>
+      <param key="lcCooperative" value="0.0"/>
+      <param key="lcSpeedGain" value="1.0"/>
+      <param key="lcPushy" value="1.0"/>
+      <param key="lcAssertive" value="1.0"/>
+      <param key="lcKeepRight" value="0.0"/>
+
+    </vType>
+
+
+    <!-- Emergency Vehicle Routes (Sorted by Departure Time) -->
+    <!-- Departure at 10.0 -->
+    <trip id="amb1" type="ambulance" depart="10.0" departLane="best" departSpeed="max" from="308558730" to="238742346#2"/>
+    
+    <!-- Departure at 30.0 -->
+    <trip id="police1" type="police" depart="30.0" departLane="best" departSpeed="max" from="909564596#0" to="-6183287#8"/>
+    
+    <!-- Departure at 60.0 -->
+
+    <trip id="fire1" type="fire_truck" depart="60.0" departLane="best" departSpeed="max" from="-494873600" to="150872522"/>
+    
+    <!-- Departure at 120.0 -->
+    <trip id="amb2" type="ambulance" depart="120.0" departLane="best" departSpeed="max" from="494873607" to="229193804#3"/>
+    
+    <!-- Departure at 150.0 -->
+    <trip id="police2" type="police" depart="150.0" departLane="best" departSpeed="max" from="-238483769#2" to="-236288233#0"/>
+    
+    <!-- Departure at 180.0 -->
+    <trip id="fire2" type="fire_truck" depart="180.0" departLane="best" departSpeed="max" from="-1327050102#1" to="355514661#5"/>
+    
+    <!-- Departure at 240.0 -->
+    <trip id="amb3" type="ambulance" depart="240.0" departLane="best" departSpeed="max" from="150901782" to="-106373380#0"/>
+    
+    <!-- Departure at 270.0 -->
+    <trip id="police3" type="police" depart="270.0" departLane="best" departSpeed="max" from="371458000" to="200015402#3"/>
+    
+    <!-- Departure at 300.0 -->
+    <trip id="fire3" type="fire_truck" depart="300.0" departLane="best" departSpeed="max" from="106373389#2" to="-238483774#2"/>
+</routes> 

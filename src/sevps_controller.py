@@ -103,6 +103,7 @@ class SUMOTrafficController:
         self.network = None
         self.simulation_step = 0
         self.metrics = SEVPSMetrics()
+        self.router = EmergencyRouter()
         
         # Initialize SUMO connection
         self._initialize_sumo()
@@ -121,7 +122,7 @@ class SUMOTrafficController:
             "--waiting-time-memory", "300",
             "--time-to-teleport", "-1",  # Disable teleporting
             "--collision.action", "warn",
-            "--step-length", "0.1"  # 100ms step length for responsive control
+            "--step-length", "1"  # 100ms step length for responsive control
         ])
         
         traci.start(sumo_cmd)
@@ -136,16 +137,16 @@ class SUMOTrafficController:
         root = tree.getroot()
         for net_tag in root.findall('.//net-file'):
             net_file = net_tag.get('value')
-            break
+            
         
         if net_file:
-            self.network = sumolib.net.readNet(net_file)
+            self.network = sumolib.net.readNet('map/'+ net_file)
             print(f"📍 Network loaded: {len(self.network.getNodes())} nodes, {len(self.network.getEdges())} edges")
         else:
             print("⚠️ Warning: Could not find network file in config")
     
     def _setup_traffic_lights(self):
-        """Initialize all traffic lights in the network"""
+        """Initialize/Collect all traffic lights information in the network"""
         tls_ids = traci.trafficlight.getIDList()
         
         for tls_id in tls_ids:
@@ -209,12 +210,34 @@ class SUMOTrafficController:
             if route_id is None:
                 route_id = traci.vehicle.getRouteID(vehicle_id)
             
+            # Get original route metrics
+            current_route = traci.vehicle.getRoute(vehicle_id)
+            original_metrics = self.router.get_route_metrics(current_route)
+            self.metrics.log_route_metrics(vehicle_id, 'original', original_metrics)
+            
+            # Optimize route
+            emergency_vehicle = {
+                'id': vehicle_id,
+                'route': current_route,
+                'type': traci.vehicle.getTypeID(vehicle_id)
+            }
+            optimized_route = self.router.optimize_route(emergency_vehicle)
+            # optimized_route = None
+            
+            if optimized_route:
+                # Apply the optimized route
+                traci.vehicle.setRoute(vehicle_id, optimized_route)
+                
+                # Get optimized route metrics
+                optimized_metrics = self.router.get_route_metrics(optimized_route)
+                self.metrics.log_route_metrics(vehicle_id, 'optimized', optimized_metrics)
+            
             self.emergency_vehicles[vehicle_id] = EmergencyVehicle(
                 vehicle_id=vehicle_id,
                 emergency_type=etype,
                 priority_level=priority,
                 route_id=route_id,
-                destination=traci.vehicle.getRoute(vehicle_id)[-1] if traci.vehicle.getRoute(vehicle_id) else ""
+                destination=current_route[-1] if current_route else ""
             )
             
             # Set vehicle color for visual identification
@@ -224,8 +247,12 @@ class SUMOTrafficController:
                 EmergencyType.POLICE: (0, 0, 255)          # Blue
             }
             traci.vehicle.setColor(vehicle_id, color_map[etype])
+            print ("========================================= change color")
             
             print(f"🚨 Registered emergency vehicle: {vehicle_id} ({emergency_type})")
+            print(f"   Original route metrics: {original_metrics}")
+            if optimized_route:
+                print(f"   Optimized route metrics: {optimized_metrics}")
             
         except Exception as e:
             print(f"❌ Error registering emergency vehicle {vehicle_id}: {e}")
@@ -239,6 +266,8 @@ class SUMOTrafficController:
             
             # Change vehicle appearance for active emergency
             traci.vehicle.setSpeedMode(vehicle_id, 0b011110)  # More aggressive driving
+            traci.vehicle.setLaneChangeMode(vehicle_id, 0b000001) 
+
             self.metrics.log_emergency_activation(vehicle_id, self.simulation_step)
     
     def _calculate_affected_intersections(self, vehicle_id: str):
@@ -297,89 +326,104 @@ class SUMOTrafficController:
         active_emergencies = {vid: ev for vid, ev in self.emergency_vehicles.items() 
                             if ev.activated and traci.vehicle.getIDList().__contains__(vid)}
         
+        # Reset all traffic lights to normal operation first
         for tls_id, tls_state in self.traffic_lights.items():
-            # Check for nearby emergency vehicles
-            nearby_emergencies = self._get_nearby_emergency_vehicles(tls_id, active_emergencies)
-            
-            if nearby_emergencies:
-                self._handle_emergency_preemption(tls_id, nearby_emergencies)
-            else:
+            tls_state.emergency_override = False
+        
+        # For each emergency vehicle, find the nearest traffic light and preempt only that one
+        for ev in active_emergencies.values():
+            nearest_tls = self._get_nearest_traffic_light_for_emergency(ev)
+            if nearest_tls:
+                self._handle_emergency_preemption(nearest_tls, [ev])
+        
+        # Handle normal operation for all lights not in emergency override
+        for tls_id, tls_state in self.traffic_lights.items():
+            if not tls_state.emergency_override:
                 self._handle_normal_operation(tls_id)
             
             # Update phase timing
             tls_state.time_in_phase = traci.trafficlight.getSpentDuration(tls_id)
     
+    def _get_nearest_traffic_light_for_emergency(self, emergency_vehicle: EmergencyVehicle) -> str:
+        """Get the nearest traffic light that should be preempted for an emergency vehicle"""
+        try:
+            candidate_lights = []
+            
+            for tls_id in self.traffic_lights.keys():
+                # Check if this traffic light is on the emergency vehicle's route
+                if tls_id not in emergency_vehicle.affected_intersections:
+                    continue
+                
+                tls_position = traci.junction.getPosition(tls_id)
+                distance = self._calculate_distance(emergency_vehicle.position, tls_position)
+                
+                # Check if vehicle is approaching and within detection range
+                if (distance <= SEVPSConfig.DETECTION_RANGE and
+                    emergency_vehicle.speed > SEVPSConfig.EMERGENCY_SPEED_THRESHOLD):
+                    
+                    # Calculate ETA (Estimated Time of Arrival)
+                    eta = distance / emergency_vehicle.speed if emergency_vehicle.speed > 0 else float('inf')
+                    
+                    # Only consider for preemption if ETA is within reasonable range
+                    # (not too far, not too close - gives time for preemption to take effect)
+                    if 2 <= eta <= 30:  # Between 2 and 30 seconds
+                        candidate_lights.append({
+                            'tls_id': tls_id,
+                            'distance': distance,
+                            'eta': eta
+                        })
+            
+            if not candidate_lights:
+                return None
+            
+            # Sort by ETA (closest in time gets priority)
+            candidate_lights.sort(key=lambda x: x['eta'])
+            nearest_tls = candidate_lights[0]['tls_id']
+            
+            print(f"🚦 Selected nearest TLS {nearest_tls} for {emergency_vehicle.vehicle_id} "
+                  f"(ETA: {candidate_lights[0]['eta']:.1f}s, Distance: {candidate_lights[0]['distance']:.1f}m)")
+            
+            return nearest_tls
+            
+        except Exception as e:
+            print(f"⚠️ Error getting nearest traffic light for {emergency_vehicle.vehicle_id}: {e}")
+            return None
+    
     def _get_nearby_emergency_vehicles(self, tls_id: str, active_emergencies: Dict[str, EmergencyVehicle]) -> List[EmergencyVehicle]:
-        """Get emergency vehicles near a traffic light"""
+        """Get emergency vehicles near a traffic light (updated for improved logic)"""
         nearby = []
         
         try:
             tls_position = traci.junction.getPosition(tls_id)
             
             for ev in active_emergencies.values():
-                # Skip if vehicle is not moving
-                if ev.speed < SEVPSConfig.EMERGENCY_SPEED_THRESHOLD:
-                    continue
-                    
                 distance = self._calculate_distance(ev.position, tls_position)
                 
                 # Check if vehicle is approaching and within detection range
-                if distance <= SEVPSConfig.DETECTION_RANGE:
-                    # Check if vehicle is actually approaching the intersection
-                    if self._is_approaching_intersection(ev, tls_id):
+                if (distance <= SEVPSConfig.DETECTION_RANGE and
+                    ev.speed > SEVPSConfig.EMERGENCY_SPEED_THRESHOLD and
+                    tls_id in ev.affected_intersections):
+                    
+                    # Calculate ETA
+                    eta = distance / ev.speed if ev.speed > 0 else float('inf')
+                    
+                    # Only include if ETA is within reasonable preemption window
+                    if 2 <= eta <= 30:
                         nearby.append(ev)
-                        print(f"🚦 Emergency vehicle {ev.vehicle_id} approaching {tls_id} at distance {distance:.1f}m")
         
         except Exception as e:
             print(f"⚠️ Error getting nearby vehicles for {tls_id}: {e}")
         
         return sorted(nearby, key=lambda x: x.priority_level, reverse=True)
     
-    def _is_approaching_intersection(self, ev: EmergencyVehicle, tls_id: str) -> bool:
-        """Check if emergency vehicle is actually approaching the intersection"""
-        try:
-            # Get the current edge and next edge in route
-            current_edge = ev.current_edge
-            
-            # Skip if vehicle is in a junction (edge ID starts with ':')
-            if current_edge.startswith(':'):
-                return False
-                
-            route_index = traci.vehicle.getRouteIndex(ev.vehicle_id)
-            route = traci.vehicle.getRoute(ev.vehicle_id)
-            
-            if route_index < len(route) - 1:
-                next_edge = route[route_index + 1]
-                
-                # Skip if next edge is a junction
-                if next_edge.startswith(':'):
-                    return False
-                
-                # Get the junction between current and next edge
-                current_edge_obj = self.network.getEdge(current_edge)
-                next_edge_obj = self.network.getEdge(next_edge)
-                
-                if current_edge_obj and next_edge_obj:
-                    junction = current_edge_obj.getToNode()
-                    if junction.getID() == tls_id:
-                        return True
-            
-            return False
-            
-        except Exception as e:
-            # Only print error if it's not a junction-related error
-            if not str(e).startswith(':'):
-                print(f"⚠️ Error checking intersection approach: {e}")
-            return False
-    
     def _handle_emergency_preemption(self, tls_id: str, emergency_vehicles: List[EmergencyVehicle]):
-        """Handle traffic light preemption for emergency vehicles"""
+        """Handle traffic light preemption for emergency vehicles (improved)"""
         tls_state = self.traffic_lights[tls_id]
         highest_priority_ev = emergency_vehicles[0]
         
         try:
             # Calculate required green phase for emergency vehicle
-            required_phase = self._calculate_required_phase(tls_id, highest_priority_ev)
+            required_phase = self._calculate_required_phase_fixed(tls_id, highest_priority_ev)
             current_phase = traci.trafficlight.getPhase(tls_id)
             
             # Check if preemption is needed
@@ -417,7 +461,47 @@ class SUMOTrafficController:
                 for phase_idx, phase in enumerate(logic.phases):
                     if phase_idx < len(phase.state) and phase.state[lane_index] in ['G', 'g']:
                         return phase_idx
+            if vehicle_lane == '-518147860#3_0':
+                print(f"==== Debugging ==== {vehicle_lane}")
+                if vehicle_lane not in controlled_lanes:
+                    print("not in controlled lanes")
+            return 0  # Default to first phase
             
+        except Exception as e:
+            print(f"⚠️ Error calculating required phase: {e}")
+            return 0
+    def _calculate_required_phase_fixed(self, tls_id: str, emergency_vehicle: EmergencyVehicle) -> int:
+        """Calculate which phase gives green to emergency vehicle's direction"""
+        try:
+            # Get vehicle's current lane
+            route = traci.vehicle.getRoute(emergency_vehicle.vehicle_id)
+            current_index = traci.vehicle.getRouteIndex(emergency_vehicle.vehicle_id)
+
+            # Check next 2 edges in route
+            next_edges = route[current_index:current_index + 5]
+            controlled_edges = [lane.split('_')[0] for lane in traci.trafficlight.getControlledLanes(tls_id)]
+
+        
+            # Find intersection of next edges and controlled edges
+            target_edges = set(next_edges) & set(controlled_edges)
+            
+            if not target_edges:
+                return 0
+            
+            # Use the first matching edge
+            target_edge = list(target_edges)[0]
+            
+            # Get any lane on this edge and find its green phase
+            controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
+            for lane in controlled_lanes:
+                if lane.startswith(target_edge + '_'):
+                    lane_index = controlled_lanes.index(lane)
+                    logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
+                    
+                    # Return first phase that gives green to any lane on target edge
+                    for phase_idx, phase in enumerate(logic.phases):
+                        if lane_index < len(phase.state) and phase.state[lane_index] in ['G', 'g']:
+                            return phase_idx
             return 0  # Default to first phase
             
         except Exception as e:
@@ -445,6 +529,21 @@ class SUMOTrafficController:
             tls_state.emergency_override = False
             traci.trafficlight.setProgram(tls_id, tls_state.normal_program)
             print(f"🚦 NORMAL: {tls_id} returned to normal operation")
+    
+    def _calculate_eta_to_intersection(self, emergency_vehicle: EmergencyVehicle, tls_id: str) -> float:
+        """Calculate estimated time of arrival for emergency vehicle to intersection"""
+        try:
+            tls_position = traci.junction.getPosition(tls_id)
+            distance = self._calculate_distance(emergency_vehicle.position, tls_position)
+            
+            if emergency_vehicle.speed > 0:
+                return distance / emergency_vehicle.speed
+            else:
+                return float('inf')
+                
+        except Exception as e:
+            print(f"⚠️ Error calculating ETA for {emergency_vehicle.vehicle_id} to {tls_id}: {e}")
+            return float('inf')
     
     def send_v2v_alerts(self):
         """Send V2V alerts to civilian vehicles about approaching emergency vehicles"""
@@ -474,63 +573,59 @@ class SUMOTrafficController:
     def _send_lane_change_suggestion(self, civilian_id: str, emergency_vehicle: EmergencyVehicle):
         """Suggest lane change to civilian vehicle to make way for emergency vehicle"""
         try:
-            # Get current lane and road information
-            current_lane = traci.vehicle.getLaneIndex(civilian_id)
-            edge_id = traci.vehicle.getRoadID(civilian_id)
-            num_lanes = traci.edge.getLaneNumber(edge_id)
-            
-            # Get emergency vehicle's lane
+            # Get current lane of civilian and emergency vehicle
+            civilian_lane = traci.vehicle.getLaneIndex(civilian_id)
             ev_lane = traci.vehicle.getLaneIndex(emergency_vehicle.vehicle_id)
-            ev_edge = traci.vehicle.getRoadID(emergency_vehicle.vehicle_id)
             
-            # Only suggest lane change if on the same road and emergency vehicle is approaching
-            if edge_id == ev_edge:
-                # Calculate relative position
-                ev_pos = traci.vehicle.getPosition(emergency_vehicle.vehicle_id)
-                civ_pos = traci.vehicle.getPosition(civilian_id)
+            # Get positions and calculate relative position
+            civilian_pos = traci.vehicle.getPosition(civilian_id)
+            ev_pos = traci.vehicle.getPosition(emergency_vehicle.vehicle_id)
+            edge_id = traci.vehicle.getRoadID(civilian_id)
+            
+            # Only suggest lane change if emergency vehicle is behind and approaching
+            if not self._is_behind(ev_pos, civilian_pos, edge_id):
+                return
+            # Check if edge has multiple lanes
+            lanes = traci.edge.getLaneNumber(edge_id)
+            if lanes < 1:
+                return
+            # Calculate distance between vehicles
+            distance = self._calculate_distance(ev_pos, civilian_pos)
+            
+            # Only suggest lane change if within V2V range and on same/adjacent lane
+            if distance <= SEVPSConfig.V2V_RANGE and abs(civilian_lane - ev_lane) <= 1:
+                edge_lanes = traci.edge.getLaneNumber(edge_id)
                 
-                # Only suggest lane change if emergency vehicle is behind
-                if self._is_behind(ev_pos, civ_pos, edge_id):
-                    # Find available lanes
-                    available_lanes = []
-                    for lane_idx in range(num_lanes):
-                        if lane_idx != current_lane:  # Don't suggest current lane
-                            # Check if lane exists and is not blocked
-                            lane_id = f"{edge_id}_{lane_idx}"
-                            if traci.lane.getLastStepVehicleNumber(lane_id) < 2:  # Lane has space
+                # Find available lanes that aren't blocked
+                available_lanes = []
+                for lane_idx in range(edge_lanes):
+                    if lane_idx != civilian_lane:  # Don't suggest current lane
+                        # Check if lane exists and is not blocked
+                        lane_id = f"{edge_id}_{lane_idx}"
+                        if traci.lane.getLastStepVehicleNumber(lane_id) < 2:  # Lane has space
+                            # Check if lane is not blocked by other vehicles
+                            lane_vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                            if not any(traci.vehicle.getSpeed(vid) < 0.1 for vid in lane_vehicles):
                                 available_lanes.append(lane_idx)
+                
+                if available_lanes:
+                    # Choose the lane furthest from emergency vehicle's lane
+                    target_lane = max(available_lanes, key=lambda x: abs(x - ev_lane))
                     
-                    if available_lanes:
-                        # Choose the lane furthest from emergency vehicle's lane
-                        target_lane = max(available_lanes, key=lambda x: abs(x - ev_lane))
-                        
-                        # Only change lane if not already changing
-                        if not traci.vehicle.isChangingLane(civilian_id):
+                    # Check distance to next intersection
+                    next_tls = traci.vehicle.getNextTLS(civilian_id)
+                    if not next_tls or next_tls[0][2] > 50:  # At least 50m from next traffic light
+                        # Check if vehicle is already in the target lane
+                        if civilian_lane != target_lane:
                             # Use lane change mode to encourage lane change
-                            traci.vehicle.changeLane(civilian_id, target_lane, 5.0)  # 5 second duration
+                            traci.vehicle.changeLane(civilian_id, target_lane, 10.0)  # 10 second duration
                             
                             # Visual indicator
-                            traci.vehicle.setColor(civilian_id, (255, 255, 0))  # Yellow color temporarily
+                            traci.vehicle.setColor(civilian_id, (0, 255, 255))  # Cyan color temporarily
+                            print (f"==== Debugging ==== {civilian_id} changed lane to {target_lane}")
                 
         except Exception as e:
             print(f"⚠️ Error sending V2V alert: {e}")
-    
-    def _is_behind(self, pos1: Tuple[float, float], pos2: Tuple[float, float], edge_id: str) -> bool:
-        """Check if pos1 is behind pos2 on the same edge"""
-        try:
-            # Get edge shape
-            edge_shape = traci.edge.getShape(edge_id)
-            if len(edge_shape) < 2:
-                return False
-                
-            # Calculate distances along edge
-            dist1 = traci.simulation.getDistance2D(pos1[0], pos1[1], edge_shape[0][0], edge_shape[0][1])
-            dist2 = traci.simulation.getDistance2D(pos2[0], pos2[1], edge_shape[0][0], edge_shape[0][1])
-            
-            return dist1 < dist2
-            
-        except Exception:
-            return False
     
     def _calculate_distance(self, pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
         """Calculate Euclidean distance between two positions"""
@@ -558,6 +653,23 @@ class SUMOTrafficController:
         traci.close()
         print("🔚 SUMO simulation closed")
 
+    def _is_behind(self, pos1: Tuple[float, float], pos2: Tuple[float, float], edge_id: str) -> bool:
+        """Check if pos1 is behind pos2 on the same edge"""
+        try:
+            # Get edge shape
+            edge_shape = traci.edge.getShape(edge_id)
+            if len(edge_shape) < 2:
+                return False
+                
+            # Calculate distances along edge
+            dist1 = traci.simulation.getDistance2D(pos1[0], pos1[1], edge_shape[0][0], edge_shape[0][1])
+            dist2 = traci.simulation.getDistance2D(pos2[0], pos2[1], edge_shape[0][0], edge_shape[0][1])
+            
+            return dist1 < dist2
+            
+        except Exception:
+            return False
+
 # ============================================================================
 # METRICS AND PERFORMANCE TRACKING
 # ============================================================================
@@ -571,6 +683,10 @@ class SEVPSMetrics:
         self.response_times = []
         self.civilian_delays = []
         self.step_data = []
+        self.route_metrics = {
+            'original': [],
+            'optimized': []
+        }
     
     def log_emergency_activation(self, vehicle_id: str, step: int):
         """Log emergency vehicle activation"""
@@ -601,6 +717,12 @@ class SEVPSMetrics:
             'active_preemptions': active_preemptions
         })
     
+    def log_route_metrics(self, vehicle_id: str, route_type: str, metrics: Dict):
+        """Log route performance metrics"""
+        metrics['vehicle_id'] = vehicle_id
+        metrics['route_type'] = route_type
+        self.route_metrics[route_type].append(metrics)
+    
     def generate_report(self) -> Dict:
         """Generate comprehensive performance report"""
         df_steps = pd.DataFrame(self.step_data)
@@ -616,6 +738,207 @@ class SEVPSMetrics:
         }
         
         return report
+    
+    def generate_route_report(self) -> Dict:
+        """Generate route optimization report"""
+        if not self.route_metrics['original'] or not self.route_metrics['optimized']:
+            return {}
+        
+        df_original = pd.DataFrame(self.route_metrics['original'])
+        df_optimized = pd.DataFrame(self.route_metrics['optimized'])
+        
+        # Calculate improvements
+        improvements = {}
+        for metric in ['duration', 'waiting_time', 'time_loss', 'speed']:
+            if metric in df_original.columns and metric in df_optimized.columns:
+                orig_mean = df_original[metric].mean()
+                opt_mean = df_optimized[metric].mean()
+                if metric == 'speed':
+                    # For speed, higher is better
+                    improvement = ((opt_mean - orig_mean) / orig_mean) * 100
+                else:
+                    # For other metrics, lower is better
+                    improvement = ((orig_mean - opt_mean) / orig_mean) * 100
+                improvements[f'{metric}_improvement'] = improvement
+        
+        return improvements
+
+class EmergencyRouter:
+    """Advanced route optimization for emergency vehicles"""
+    
+    def __init__(self):
+        """Initialize the emergency router with a directed graph"""
+        self.network = nx.DiGraph()
+        # Load the network file
+        self.net = sumolib.net.readNet('map/osm.net.xml.gz')
+        # Network will be built when first needed
+        self.nodes = [node.getID() for node in self.net.getNodes()]
+    
+    def _build_network(self):
+        """Build the network graph from SUMO network"""
+        # Clear existing network
+        self.network.clear()
+        
+        # Add nodes (junctions)
+        for junction in self.net.getNodes():
+            self.network.add_node(junction.getID())
+        
+        # Add edges (roads)
+        for edge in self.net.getEdges():
+            if edge.allows('passenger'):
+                from_node = edge.getFromNode().getID()
+                to_node = edge.getToNode().getID()
+                length = edge.getLength()
+                self.network.add_edge(from_node, to_node, weight=length, edge_id=edge.getID())
+        
+        print(f"Loaded graph with {len(self.network.nodes())} nodes and {len(self.network.edges())} edges")
+    
+    def optimize_route(self, emergency_vehicle: Dict) -> Optional[List[str]]:
+        """
+        Optimize route for an emergency vehicle based on current traffic conditions
+        
+        Args:
+            emergency_vehicle: Dictionary containing vehicle information
+            
+        Returns:
+            List of edge IDs representing the optimized route, or None if no route found
+        """
+        # Build network if not already built
+        if len(self.network.edges) == 0:
+            self._build_network()
+            
+        # Get current position and destination
+        current_edge = traci.vehicle.getRoadID(emergency_vehicle['id'])
+        if current_edge.startswith(":") or current_edge in self.nodes:
+            print("==== [Debug] ==== : Vehicle is in junction")
+            return None
+        else:
+            current_node = self._get_current_node(current_edge, type='from')
+        
+        route = emergency_vehicle['route']
+        destination = route[-1]
+        destination_node = self._get_current_node(destination, type='to')
+        
+        if current_node == destination_node:
+            print("==== [Debug] ==== : current_node is the same as destination_node")
+            return None
+            
+        # Update edge weights based on current traffic conditions
+        self._update_edge_weights()
+        
+        try:
+            # Find shortest path using Dijkstra's algorithm
+            path = nx.shortest_path(
+                self.network,
+                source=current_node,
+                target=destination_node,
+                weight='weight'
+            )
+    
+            # Convert node path to edge path
+            edge_path = []
+            for i in range(len(path) - 1):
+                edge = self.network[path[i]][path[i + 1]]['edge_id']
+                edge_path.append(edge)
+                
+            return self.check_and_fix_path([current_edge] + edge_path)
+            
+        except nx.NetworkXNoPath:
+            print(f"No path found for vehicle {emergency_vehicle['id']}")
+            return None
+    
+    def _update_edge_weights(self):
+        """Update edge weights based on current traffic conditions"""
+        edge_id_list = [edge.getID() for edge in self.net.getEdges()]
+        
+        for edge_id in edge_id_list:
+            # Get current traffic data
+            vehicle_count = traci.edge.getLastStepVehicleNumber(edge_id)
+            mean_speed = traci.edge.getLastStepMeanSpeed(edge_id)
+            
+            # Get edge from network
+            edge = self.net.getEdge(edge_id)
+            if edge:
+                max_speed = edge.getSpeed()
+                
+                # Calculate congestion factor
+                if mean_speed > 0:
+                    congestion_factor = 1 + (vehicle_count * (1 - mean_speed/max_speed))
+                else:
+                    congestion_factor = float('inf')
+                
+                # Update edge weight
+                base_length = edge.getLength()
+                from_node = edge.getFromNode().getID()
+                to_node = edge.getToNode().getID()
+                
+                if self.network.has_edge(from_node, to_node):
+                    self.network[from_node][to_node]['weight'] = base_length * congestion_factor
+    
+    def _get_current_node(self, edge_id, type='from'):
+        """Get the node ID for a given edge"""
+        edge = self.net.getEdge(edge_id)
+        if edge:
+            if type == 'from':
+                return edge.getToNode().getID()
+            elif type == 'to':
+                return edge.getToNode().getID()
+        return None
+    def check_and_fix_path(self, path):
+        """Fixes path by inserting any missing edges between disconnected segments.
+        
+        Args:
+            path (List[str]): Original edge path
+        Returns:
+            fixed_path: list of edges with missing intermediate edges inserted to ensure connectivity.
+        """
+        if not path:
+            return []
+
+        fixed_path = [path[0]]  # Start with the first edge
+
+        for i in range(len(path) - 1):
+            from_edge = self.net.getEdge(path[i])
+            to_edge = self.net.getEdge(path[i + 1])
+
+            shortest_subpath = [edge.getID() for edge in self.net.getShortestPath(from_edge, to_edge, vClass="passenger")[0]]
+            if not shortest_subpath:
+                raise ValueError(f"No path found in SUMO between {from_edge} and {to_edge}")
+
+            fixed_path.extend(shortest_subpath[1:])
+        
+        return fixed_path
+    def get_route_metrics(self, route: List[str]) -> Dict[str, float]:
+        """
+        Calculate metrics for a given route
+        
+        Args:
+            route: List of edge IDs representing the route
+            
+        Returns:
+            Dictionary containing route metrics
+        """
+        total_length = 0
+        total_time = 0
+        
+        for edge_id in route:
+            # Get edge from network
+            edge = self.net.getEdge(edge_id)
+            if edge:
+                # Get edge length
+                length = edge.getLength()
+                total_length += length
+                
+                # Estimate time based on current speed
+                mean_speed = traci.edge.getLastStepMeanSpeed(edge_id)
+                if mean_speed > 0:
+                    total_time += length / mean_speed
+        
+        return {
+            'total_length': total_length,
+            'estimated_time': total_time,
+            'num_edges': len(route)
+        }
 
 # ============================================================================
 # MAIN EXECUTION AND TESTING
@@ -639,20 +962,24 @@ class SEVPSDemo:
             # Check if vehicle is an emergency vehicle based on type
             vehicle_type = traci.vehicle.getTypeID(vehicle_id)
             if vehicle_type in ['ambulance', 'fire_truck', 'police']:
-                self.controller.register_emergency_vehicle(vehicle_id, vehicle_type)
-                self.registered_vehicles.add(vehicle_id)
-                print(f"🚨 Registered emergency vehicle: {vehicle_id} ({vehicle_type})")
-                
-                # Automatically activate the emergency vehicle
-                self.controller.activate_emergency_vehicle(vehicle_id)
-                print(f"🚨 Activated emergency response for: {vehicle_id}")
+                # Only register if vehicle is actually moving
+                if traci.vehicle.getSpeed(vehicle_id) > SEVPSConfig.EMERGENCY_SPEED_THRESHOLD:
+                    self.controller.register_emergency_vehicle(vehicle_id, vehicle_type)
+                    self.registered_vehicles.add(vehicle_id)
+                    
+                    # Automatically activate emergency response for all emergency vehicles
+                    self.controller.activate_emergency_vehicle(vehicle_id)
+                    print(f"🚨 Activated emergency response for: {vehicle_id}")
     
     def run_demo(self, duration_seconds: int = 3600):
         """Run full SEVPS demonstration"""
         print("🚀 Starting SEVPS Demonstration")
         print(f"   Duration: {duration_seconds} seconds")
+        print(f"   Emergency vehicles: {len(self.controller.emergency_vehicles)}")
+        print(f"   Traffic lights: {len(self.controller.traffic_lights)}")
         
         target_steps = int(duration_seconds / 0.1)  # 0.1 second per step
+        last_status = {'emergencies': 0, 'preemptions': 0}  # Track last status
         
         try:
             while self.controller.simulation_step < target_steps:
@@ -662,35 +989,42 @@ class SEVPSDemo:
                 # Run simulation step
                 self.controller.run_simulation_step()
                 
-                # Status update every 5 seconds
-                if self.controller.simulation_step % 50 == 0:
+                # Status update every 10 seconds and only if there are changes
+                if self.controller.simulation_step % 100 == 0:  # Changed from 50 to 100 (10 seconds)
                     elapsed_time = self.controller.simulation_step * 0.1
                     active_emergencies = sum(1 for ev in self.controller.emergency_vehicles.values() if ev.activated)
                     active_preemptions = sum(1 for tls in self.controller.traffic_lights.values() if tls.emergency_override)
                     
-                    print(f"⏱️  Time: {elapsed_time:.1f}s | Active emergencies: {active_emergencies} | Preemptions: {active_preemptions}")
-                    
-                    # Print more detailed status for active emergencies
-                    if active_emergencies > 0:
-                        print("\nActive Emergency Vehicles:")
-                        for ev_id, ev in self.controller.emergency_vehicles.items():
-                            if ev.activated:
-                                # Get nearby traffic lights
-                                nearby_tls = []
-                                for tls_id in self.controller.traffic_lights:
-                                    tls_pos = traci.junction.getPosition(tls_id)
-                                    distance = self.controller._calculate_distance(ev.position, tls_pos)
-                                    if distance <= SEVPSConfig.PREEMPTION_RANGE:  # Use PREEMPTION_RANGE instead of DETECTION_RANGE
-                                        nearby_tls.append(f"{tls_id}({distance:.1f}m)")
-                                
-                                status = "Moving" if ev.speed > SEVPSConfig.EMERGENCY_SPEED_THRESHOLD else "Stopped"
-                                print(f"   - {ev_id}:")
-                                print(f"     Speed: {ev.speed:.1f} m/s ({status})")
-                                print(f"     Position: {ev.current_edge}")
-                                if nearby_tls:
-                                    print(f"     Nearby traffic lights: {', '.join(nearby_tls)}")
-                                if ev.affected_intersections:
-                                    print(f"     Will affect intersections: {', '.join(ev.affected_intersections)}")
+                    # Only print if there are changes in status
+                    if (active_emergencies != last_status['emergencies'] or 
+                        active_preemptions != last_status['preemptions']):
+                        print(f"\n⏱️  Time: {elapsed_time:.1f}s | Active emergencies: {active_emergencies} | Preemptions: {active_preemptions}")
+                        
+                        # Print more detailed status for active emergencies
+                        if active_emergencies > 0:
+                            print("\nActive Emergency Vehicles:")
+                            for ev_id, ev in self.controller.emergency_vehicles.items():
+                                if ev.activated:
+                                    # Get nearby traffic lights
+                                    nearby_tls = []
+                                    for tls_id in self.controller.traffic_lights:
+                                        tls_pos = traci.junction.getPosition(tls_id)
+                                        distance = self.controller._calculate_distance(ev.position, tls_pos)
+                                        if distance <= SEVPSConfig.PREEMPTION_RANGE:
+                                            nearby_tls.append(f"{tls_id}({distance:.1f}m)")
+                                    
+                                    status = "Moving" if ev.speed > SEVPSConfig.EMERGENCY_SPEED_THRESHOLD else "Stopped"
+                                    print(f"   - {ev_id}:")
+                                    print(f"     Speed: {ev.speed:.1f} m/s ({status})")
+                                    print(f"     Position: {ev.current_edge}")
+                                    if nearby_tls:
+                                        print(f"     Nearby traffic lights: {', '.join(nearby_tls)}")
+                                    if ev.affected_intersections:
+                                        print(f"     Will affect intersections: {', '.join(ev.affected_intersections)}")
+                        
+                        # Update last status
+                        last_status['emergencies'] = active_emergencies
+                        last_status['preemptions'] = active_preemptions
         
         except KeyboardInterrupt:
             print("\n🛑 Simulation interrupted by user")
@@ -711,19 +1045,26 @@ def run_sevps_example():
     """Example usage of SEVPS with SUMO"""
     
     # Configuration - Using the user's SUMO config file
-    SUMO_CONFIG = "osm.sumocfg"
+    SUMO_CONFIG = "map/osm.sumocfg"
     
     try:
         # Initialize SEVPS demo
         demo = SEVPSDemo(SUMO_CONFIG, gui=True)
         
         # Run simulation
-        demo.run_demo(duration_seconds=3600)  # 1 hour total (matching sumocfg end time)
+        demo.run_demo(duration_seconds=360)  # 1 hour total (matching sumocfg end time)
+        
+        # Generate and print route optimization report
+        route_report = demo.controller.metrics.generate_route_report()
+        print("\n📊 Route Optimization Report:")
+        for metric, improvement in route_report.items():
+            print(f"   {metric}: {improvement:.2f}%")
         
     except Exception as e:
         print(f"❌ Error running SEVPS demo: {e}")
     
     finally:
+
         demo.close()
 
 if __name__ == "__main__":
@@ -738,7 +1079,7 @@ if __name__ == "__main__":
     2. Run: python sevps_controller.py
     
     Key Features:
-    ✅ Automatic emergency vehicle detection
+    ✅ Automatic emergency vehicle detection from emergency.rou.xml
     ✅ Adaptive traffic light preemption  
     ✅ V2V communication simulation
     ✅ Performance metrics collection

@@ -9,6 +9,7 @@ A Python-based simulation system that optimizes traffic flow for emergency vehic
 - **Congestion Prediction**: Uses LSTM networks to predict traffic congestion
 - **V2X Communication**: Simulates vehicle-to-vehicle and vehicle-to-infrastructure communication
 - **Real-time Visualization**: Provides real-time metrics and performance visualization
+![Alt text](Picture1.png)
 
 ## Requirements
 
